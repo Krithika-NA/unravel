@@ -3,7 +3,7 @@ import gradio as gr
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_groq import ChatGroq
 from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
@@ -20,7 +20,7 @@ if not GROQ_API_KEY:
 
 MAX_FILE_SIZE_MB = 20
 
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 llm = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=GROQ_API_KEY)
 
 def ingest_pdf(pdf_file, session_state):
@@ -111,7 +111,7 @@ Question: {question}
     except Exception as e:
         return f"Something went wrong answering that question: {e}"
 
-with gr.Blocks(title="Unravel") as app:
+with gr.Blocks(title="RationAI") as app:
     session_state = gr.State(value={})
 
     gr.Markdown("# Unravel — Ask Your Documents Anything")
