@@ -8,4 +8,5 @@ langchain-chroma==0.1.4
 langchain-core==0.3.28
 chromadb==0.5.23
 fastembed==0.4.2
+spaces
 pypdf==5.1.0
