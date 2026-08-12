@@ -7,6 +7,7 @@ from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_groq import ChatGroq
 from langchain_core.caches import BaseCache  
 from langchain_core.callbacks import Callbacks  
+ChatGroq.model_rebuild()
 from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
