@@ -111,7 +111,7 @@ Question: {question}
     except Exception as e:
         return f"Something went wrong answering that question: {e}"
 
-with gr.Blocks(title="RationAI") as app:
+with gr.Blocks(title="Unravel") as app:
     session_state = gr.State(value={})
 
     gr.Markdown("# Unravel — Ask Your Documents Anything")
