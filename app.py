@@ -135,6 +135,7 @@ with gr.Blocks(title="RationAI") as app:
     ask_btn.click(query_rag, inputs=[question_input, session_state], outputs=answer_output)
 
 if __name__ == "__main__":
+    app.queue()
     app.launch(
         server_name="0.0.0.0",
         server_port=int(os.getenv("PORT", 7860)),
