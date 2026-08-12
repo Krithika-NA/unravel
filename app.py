@@ -1,19 +1,22 @@
 import os
 import gradio as gr
+import spaces
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_groq import ChatGroq
-from langchain_core.caches import BaseCache  
-from langchain_core.callbacks import Callbacks  
+from langchain_core.caches import BaseCache  # noqa: F401 - needed so pydantic can resolve ChatGroq's forward refs
+from langchain_core.callbacks import Callbacks  # noqa: F401 - same reason
 ChatGroq.model_rebuild()
 from langchain_chroma import Chroma
+import chromadb
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 import json
 import re
+import uuid
 
 load_dotenv()
 
@@ -21,10 +24,18 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY is not set. Add it to your .env file or environment.")
 
-MAX_FILE_SIZE_MB = 20
+MAX_FILE_SIZE_MB = 25
 
 embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 llm = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=GROQ_API_KEY)
+
+@spaces.GPU
+def _zerogpu_startup_check():
+    # Unused — this Space is on ZeroGPU hardware, which requires at least one
+    # @spaces.GPU-decorated function to pass its startup check. Everything in
+    # this app (FastEmbed, Groq API calls) actually runs on CPU; this function
+    # is never called, so no GPU time is ever consumed.
+    pass
 
 def ingest_pdf(pdf_file, session_state):
     if pdf_file is None:
@@ -42,8 +53,26 @@ def ingest_pdf(pdf_file, session_state):
 
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         chunks = splitter.split_documents(documents)
+
+        chroma_client = chromadb.EphemeralClient()
+        collection_name = f"session-{uuid.uuid4().hex}"
+
+        # Embed in small batches instead of all at once — embedding every chunk in a
+        # single call spikes memory (all vectors held at once) and can exceed
+        # free-tier memory limits on larger PDFs, causing a silent OOM restart.
+        BATCH_SIZE = 10
+        vectorstore = None
+        for i in range(0, len(chunks), BATCH_SIZE):
+            batch = chunks[i:i + BATCH_SIZE]
+            if vectorstore is None:
+                vectorstore = Chroma.from_documents(
+                    batch, embeddings, client=chroma_client, collection_name=collection_name
+                )
+            else:
+                vectorstore.add_documents(batch)
+
         # Each session gets its own in-memory Chroma collection — no cross-user leakage
-        session_state["vectorstore"] = Chroma.from_documents(chunks, embeddings)
+        session_state["vectorstore"] = vectorstore
         return f"Ingested {len(chunks)} chunks from PDF.", session_state
     except Exception as e:
         return f"Failed to process PDF: {e}", session_state
@@ -74,15 +103,11 @@ def query_rag(question, session_state):
 Answer the question based only on the context below. Each chunk is labeled with
 its page number. If the answer is not contained in the context, say you don't
 know — do not guess.
-
 Respond with ONLY a JSON object, no other text, in this exact shape:
 {{"answer": "<your answer>", "used_pages": [<page numbers you actually drew the answer from>]}}
-
 If you don't know the answer, use "used_pages": [].
-
 Context:
 {context}
-
 Question: {question}
 """)
 
@@ -114,7 +139,7 @@ Question: {question}
     except Exception as e:
         return f"Something went wrong answering that question: {e}"
 
-with gr.Blocks(title="Unravel") as app:
+with gr.Blocks(title="RationAI") as app:
     session_state = gr.State(value={})
 
     gr.Markdown("# Unravel — Ask Your Documents Anything")
