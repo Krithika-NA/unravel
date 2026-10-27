@@ -13,10 +13,10 @@ from langchain_chroma import Chroma
 import chromadb
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 import json
 import re
 import uuid
+import traceback
 
 load_dotenv()
 
@@ -25,9 +25,11 @@ if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY is not set. Add it to your .env file or environment.")
 
 MAX_FILE_SIZE_MB = 25
+NO_ANSWER_MSG = "The document doesn't answer this question."
 
 embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-llm = ChatGroq(model="llama-3.1-8b-instant", groq_api_key=GROQ_API_KEY)
+llm = ChatGroq(model="openai/gpt-oss-20b", groq_api_key=GROQ_API_KEY)
+
 
 @spaces.GPU
 def _zerogpu_startup_check():
@@ -36,6 +38,25 @@ def _zerogpu_startup_check():
     # this app (FastEmbed, Groq API calls) actually runs on CPU; this function
     # is never called, so no GPU time is ever consumed.
     pass
+
+
+def parse_model_json(text):
+    """Parse the model's JSON reply, tolerating code fences and a missing outer brace."""
+    text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+    start, end = text.find("{"), text.rfind("}")
+    candidates = []
+    if start != -1 and end > start:
+        candidates.append(text[start:end + 1])
+    candidates.append("{" + text.strip().strip("{}").strip() + "}")
+    for c in candidates:
+        try:
+            parsed = json.loads(c)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    return None
+
 
 def ingest_pdf(pdf_file, session_state):
     if pdf_file is None:
@@ -54,12 +75,14 @@ def ingest_pdf(pdf_file, session_state):
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         chunks = splitter.split_documents(documents)
 
-        chroma_client = chromadb.EphemeralClient()
+        # Each ingest gets its own Chroma database in its own folder under /tmp,
+        # so sessions are fully isolated and no client or tenant state is shared.
         collection_name = f"session-{uuid.uuid4().hex}"
+        chroma_client = chromadb.PersistentClient(path=f"/tmp/chroma_{collection_name}")
 
         # Embed in small batches instead of all at once — embedding every chunk in a
-        # single call spikes memory (all vectors held at once) and can exceed
-        # free-tier memory limits on larger PDFs, causing a silent OOM restart.
+        # single call spikes memory and can exceed free-tier memory limits on larger
+        # PDFs, causing a silent OOM restart.
         BATCH_SIZE = 10
         vectorstore = None
         for i in range(0, len(chunks), BATCH_SIZE):
@@ -71,11 +94,12 @@ def ingest_pdf(pdf_file, session_state):
             else:
                 vectorstore.add_documents(batch)
 
-        # Each session gets its own in-memory Chroma collection — no cross-user leakage
         session_state["vectorstore"] = vectorstore
         return f"Ingested {len(chunks)} chunks from PDF.", session_state
     except Exception as e:
+        print(traceback.format_exc(), flush=True)
         return f"Failed to process PDF: {e}", session_state
+
 
 def query_rag(question, session_state):
     vectorstore = session_state.get("vectorstore") if session_state else None
@@ -85,7 +109,7 @@ def query_rag(question, session_state):
         return "Please type a question."
 
     try:
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
         docs = retriever.invoke(question)
         if not docs:
             return "No relevant content found in the document for that question."
@@ -101,11 +125,13 @@ def query_rag(question, session_state):
 
         prompt = ChatPromptTemplate.from_template("""
 Answer the question based only on the context below. Each chunk is labeled with
-its page number. If the answer is not contained in the context, say you don't
-know — do not guess.
+its page number. The context must directly answer the exact question asked.
+If it only covers a related but different topic, say the retrieved text does not
+answer the question and give an empty used_pages list. Do not guess.
+If the context lists several categories, amounts or conditions that answer the question, include all of them. Leave out details that do not answer it.
 Respond with ONLY a JSON object, no other text, in this exact shape:
 {{"answer": "<your answer>", "used_pages": [<page numbers you actually drew the answer from>]}}
-If you don't know the answer, use "used_pages": [].
+If the context does not answer the question, set "answer" to "The document doesn't answer this question." and use "used_pages": [].
 Context:
 {context}
 Question: {question}
@@ -114,32 +140,33 @@ Question: {question}
         chain = prompt | llm | StrOutputParser()
         raw = chain.invoke({"context": context, "question": question})
 
-        # Be defensive: strip markdown code fences if the model adds them anyway
-        cleaned = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+        parsed = parse_model_json(raw)
 
-        try:
-            parsed = json.loads(cleaned)
+        if parsed is not None:
             answer = str(parsed.get("answer", "")).strip()
             used_pages_raw = parsed.get("used_pages", [])
+            if not isinstance(used_pages_raw, list):
+                used_pages_raw = []
             used_pages = [p for p in used_pages_raw if isinstance(p, int)]
             if not answer:
-                raise ValueError("empty answer field")
+                return NO_ANSWER_MSG
             if used_pages:
                 return f"{answer}\n\n📄 Sources: Pages {sorted(set(used_pages))}"
             return answer
-        except (json.JSONDecodeError, ValueError):
-            # Fallback if the model didn't return valid JSON — still show something
-            # useful rather than erroring out, but be honest these are retrieved
-            # chunks, not confirmed sources.
-            all_pages = sorted(set(
-                (doc.metadata.get("page", 0) + 1) if isinstance(doc.metadata.get("page"), int) else "?"
-                for doc in docs
-            ))
-            return f"{raw.strip()}\n\n📄 Retrieved from: Pages {all_pages} (unconfirmed — model didn't return structured citations)"
+
+        # Fallback if the reply couldn't be parsed at all — show the text, and be
+        # honest that these pages are only what was retrieved, not confirmed sources.
+        all_pages = sorted(set(
+            (doc.metadata.get("page", 0) + 1) if isinstance(doc.metadata.get("page"), int) else "?"
+            for doc in docs
+        ), key=str)
+        return f"{raw.strip()}\n\n📄 Retrieved from: Pages {all_pages} (unconfirmed — model didn't return structured citations)"
     except Exception as e:
+        print(traceback.format_exc(), flush=True)
         return f"Something went wrong answering that question: {e}"
 
-with gr.Blocks(title="RationAI") as app:
+
+with gr.Blocks(title="Unravel") as app:
     session_state = gr.State(value={})
 
     gr.Markdown("# Unravel — Ask Your Documents Anything")
