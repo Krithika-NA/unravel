@@ -54,3 +54,11 @@ Open http://localhost:7860.
 - The vector store is in the session only. Documents are not saved after the session ends.
 - The free Groq tier has per-minute and per-day token limits, so heavy use can return rate-limit errors.
 
+## Future enhancements
+
+- Multi-document support: query across several PDFs at once, with citations that name the file as well as the page.
+- Better retrieval: hybrid search (keyword plus vector) and a reranking step, so the right section is found even when the question is worded differently from the document.
+- Evaluation set: a fixed list of questions with expected answers and pages, so retrieval and prompt changes can be measured instead of checked by hand.
+
+
+
